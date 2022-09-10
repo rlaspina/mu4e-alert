@@ -45,12 +45,10 @@
 (require 'pcase)
 (require 'cl-lib)
 
-
-
 ;; Customizations
 
 (defgroup mu4e-alert nil
-  "Customization options for mu4e-alert"
+  "Customization options for mu4e-alert."
   :group 'mail
   :prefix "mu4e-alert-")
 
@@ -66,7 +64,7 @@ be string to be sent to the mu's find command."
   #'mu4e-alert-default-mode-line-formatter
   "The function used to get the string to be displayed in the mode-line.
 It should be a function that accepts a single argument the current count of
-unread emails and should return the string to be displayed in the mode-line"
+unread emails and should return the string to be displayed in the mode-line."
   :type 'function
   :group 'mu4e-alert)
 
@@ -74,7 +72,7 @@ unread emails and should return the string to be displayed in the mode-line"
   #'mu4e-alert-default-email-count-notification-formatter
   "The function used to get the message for the desktop notification.
 It should be a function that accepts a single argument the current count of
-unread emails and should return the string to be used for the notification"
+unread emails and should return the string to be used for the notification."
   :type 'function
   :group 'mu4e-alert)
 
@@ -139,7 +137,7 @@ subjects - Notify with some content of the email, by default the emails are
 (defcustom mu4e-alert-set-window-urgency t
   "Set window urgency on recieving unread emails.
 
-If non-nil `mu4e-alert' will set the WM_URGENT on detecting unread messages"
+If non-nil `mu4e-alert' will set the WM_URGENT on detecting unread messages."
   :type 'boolean)
 
 (defcustom mu4e-alert-notify-repeated-mails nil
@@ -210,7 +208,48 @@ See also https://github.com/jwiegley/alert."
   :set (lambda (_ value) (mu4e-alert-set-default-style value))
   :group 'mu4e-alert)
 
+;; deal with mu4e versions above 1.7
+;; need to know whether on mu4e 1.7.x because its API changed.
+(defconst mu4e-alert--mu-is-17
+  (version-list-<= '(1 7) (version-to-list mu4e-mu-version))
+  "Non-nil if we are using mu 1.7.4 or newer.")
 
+;; declare functions to keep byte-compiler quiet
+(declare-function mu4e-running-p "mu4e-server" nil t)
+(declare-function mu4e~proc-running-p "mu4e" nil t)
+(declare-function mu4e--server-find "mu4e-server" nil t)
+(declare-function mu4e~proc-find "mu4e" nil t)
+(declare-function mu4e--init-handlers "mu4e" nil t)
+(declare-function mu4e-search "mu4e-search" nil t)
+
+;; supress byte-compiler warning in mu4e v1.7
+(eval-when-compile
+  (cl-remprop 'mu4e-headers-search 'byte-obsolete-info))
+
+;; make sure mu4e handlers are initialized in v1.7
+(when mu4e-alert--mu-is-17
+  (mu4e--init-handlers))
+
+;; create aliases for mu4e functions and variables
+(defvaralias 'mu4e-alert-mu4e-header-func-var
+  (if mu4e-alert--mu-is-17 'mu4e-headers-append-func 'mu4e-header-func)
+  "mu4e variable storing function to process emails in header view.")
+
+(defvaralias 'mu4e-alert--mu4e-context-current
+  (if mu4e-alert--mu-is-17 'mu4e--context-current 'mu4e~context-current)
+  "mu4e variables to store the current context.")
+
+(defalias 'mu4e-alert--mu4e-search
+  (if mu4e-alert--mu-is-17 #'mu4e-search #'mu4e-headers-search)
+  "mu4e function to search for mail.")
+
+(defalias 'mu4e-alert--mu4e-proc-running-p-func
+  (if mu4e-alert--mu-is-17 #'mu4e-running-p #'mu4e~proc-running-p)
+  "Function that checks whether mu4e process is running.")
+
+(defalias 'mu4e-alert--mu4e-proc-find-func
+  (if mu4e-alert--mu-is-17 #'mu4e--server-find #'mu4e~proc-find)
+  "Function that searches for mail using mu4e.")
 
 ;; Core functions
 
@@ -224,7 +263,7 @@ See also https://github.com/jwiegley/alert."
                (file-executable-p mu4e-mu-binary))
     (user-error "Please set `mu4e-mu-binary' to the full path to the mu binary, before attempting to enable `mu4e-alert'")))
 
-(defvar mu4e-alert--header-func-save mu4e-header-func
+(defvar mu4e-alert--header-func-save mu4e-alert-mu4e-header-func-var
   "Saved :header handler from mu4e.")
 
 (defvar mu4e-alert--found-func-save mu4e-found-func
@@ -236,40 +275,49 @@ See also https://github.com/jwiegley/alert."
 (defvar mu4e-alert--messages
   "List of messages received by :header callback.")
 
+(defvar mu4e-alert--finding-p nil
+  "Whether `find' request is in progress.")
+
 (defun mu4e-alert--erase-func ()
   "Erase handler for mu process.")
 
-(defun mu4e-alert--get-found-func (callback)
-  "Create found handler for mu process.
-CALLBACK will be invoked by returned lambda"
-  (lambda (_found)
-    (funcall callback mu4e-alert--messages)
-    (setq mu4e-header-func mu4e-alert--header-func-save
-          mu4e-found-func mu4e-alert--found-func-save
-          mu4e-erase-func mu4e-alert--erase-func-save)))
+(defun mu4e-alert--found-func (_found)
+  "Found handler for mu process."
+  (mu4e-alert--find-end)
+  (mu4e-alert--email-processor mu4e-alert--messages)
+  (setq mu4e-alert-mu4e-header-func-var mu4e-alert--header-func-save
+        mu4e-found-func mu4e-alert--found-func-save
+        mu4e-erase-func mu4e-alert--erase-func-save))
 
 (defun mu4e-alert--header-func (msg)
   "Message header handler for mu process.
 MSG argument is message plist."
-  (push msg mu4e-alert--messages))
-
-(defun mu4e-alert--get-mu-unread-emails-1 (callback)
-  "Get messages from mu and invoke CALLBACK."
-  (when (mu4e~proc-running-p)
-    (setq mu4e-header-func 'mu4e-alert--header-func
-          mu4e-found-func (mu4e-alert--get-found-func callback)
-          mu4e-erase-func 'mu4e-alert--erase-func)
-    (setq mu4e-alert--messages nil)
-    (mu4e~proc-find mu4e-alert-interesting-mail-query
-                    nil
-                    :date
-                    nil
-                    mu4e-alert-max-messages-to-process
-                    nil
-                    nil)))
+  (if mu4e-alert--mu-is-17
+      (setq mu4e-alert--messages msg)
+    (push msg mu4e-alert--messages)))
 
 (defvar mu4e-alert--fetch-timer nil
   "The scheduled fetching of mails from mu.")
+
+(defun mu4e-alert--get-mu-unread-emails-1 ()
+  "Get messages from mu and invoke scheduled callbacks."
+  (when (mu4e-alert--mu4e-proc-running-p-func)
+    (if mu4e-alert--finding-p
+        (setq mu4e-alert--fetch-timer
+              (run-at-time 1.0
+                           nil
+                           #'mu4e-alert--get-mu-unread-emails-1))
+      (setq mu4e-alert-mu4e-header-func-var #'mu4e-alert--header-func
+            mu4e-found-func #'mu4e-alert--found-func
+            mu4e-erase-func #'mu4e-alert--erase-func)
+      (setq mu4e-alert--messages nil)
+      (mu4e-alert--mu4e-proc-find-func mu4e-alert-interesting-mail-query
+                      nil
+                      :date
+                      'descending
+                      mu4e-alert-max-messages-to-process
+                      nil
+                      nil))))
 
 (defvar mu4e-alert--callback-queue nil
   "Callbacks queued for running after fetching mails from mu.")
@@ -298,8 +346,7 @@ CALLBACK is called with one argument the interesting emails."
   (push callback mu4e-alert--callback-queue)
   (setq mu4e-alert--fetch-timer
         (run-at-time 0.5 nil
-                     #'mu4e-alert--get-mu-unread-emails-1
-                     #'mu4e-alert--email-processor)))
+                     #'mu4e-alert--get-mu-unread-emails-1)))
 
 
 
@@ -309,7 +356,7 @@ CALLBACK is called with one argument the interesting emails."
 
 (defun mu4e-alert-default-mode-line-formatter (mail-count)
   "Default formatter used to get the string to be displayed in the mode-line.
-MAIL-COUNT is the count of mails for which the string is to displayed"
+MAIL-COUNT is the count of mails for which the string is to displayed."
   (when (not (zerop mail-count))
     (concat " "
             (propertize
@@ -334,9 +381,9 @@ MAIL-COUNT is the count of mails for which the string is to displayed"
 (defun mu4e-alert-view-unread-mails ()
   "View unread mails.
 This is primarily used to enable viewing unread emails by default mode-line
-formatter when user clicks on mode-line indicator"
+formatter when user clicks on mode-line indicator."
   (interactive)
-  (mu4e-headers-search mu4e-alert-interesting-mail-query))
+  (mu4e-alert--mu4e-search mu4e-alert-interesting-mail-query))
 
 (defun mu4e-alert-update-mail-count-modeline ()
   "Send a desktop notification about currently unread email."
@@ -426,15 +473,22 @@ This only removes the hints added by `mu4e-alert'"
                              t)))
                 mails))
 
+(defun mu4e-alert--message-address (mail key)
+  "Get a string representing address specified by KEY in MAIL."
+  (let ((addr (car (plist-get mail key))))
+    (or
+     (plist-get addr :name)
+     (plist-get addr :email)
+     (car addr)
+     (cdr addr))))
+
 (defun mu4e-alert--get-group (mail)
   "Get the group the given MAIL should be put in.
 
 This is an internal function used by `mu4e-alert-default-mails-grouper'."
   (pcase mu4e-alert-group-by
-    (`:from (or (caar (plist-get mail :from))
-                (cdar (plist-get mail :from))))
-    (`:to (or (caar (plist-get mail :to))
-              (cdar (plist-get mail :to))))
+    (`:from (mu4e-alert--message-address mail :from))
+    (`:to (mu4e-alert--message-address mail :to))
     (`:maildir (plist-get mail :maildir))
     (`:priority (symbol-value (plist-get mail :maildir)))
     (`:flags (s-join ", " (mapcar #'symbol-value
@@ -442,7 +496,7 @@ This is an internal function used by `mu4e-alert-default-mails-grouper'."
 
 (defun mu4e-alert-default-email-count-notification-formatter (mail-count)
   "Default formatter for unread email count.
-MAIL-COUNT is the count of mails for which the string is to displayed"
+MAIL-COUNT is the count of mails for which the string is to displayed."
   (when (not (zerop mail-count))
     (if (= mail-count 1)
         "You have an unread email"
@@ -550,13 +604,24 @@ ALL-MAILS are the all the unread emails"
 
 ;; Tying all the above together
 
-(defun mu4e-alert--context-switch (orig args)
+(defun mu4e-alert--context-switch (orig &rest args)
   "Advice to update mode-line after changing the context.
 ORIG is the original function to be called with ARGS."
-  (let ((context mu4e~context-current))
+  (let ((context mu4e-alert--mu4e-context-current))
     (apply orig args)
-    (unless (equal context mu4e~context-current)
+    (unless (equal context mu4e-alert--mu4e-context-current)
       (mu4e-alert-update-mail-count-modeline))))
+
+(defun mu4e-alert--find-start (&rest _)
+  "Advice to track `find' request start."
+  (setq mu4e-alert--finding-p t))
+
+(defun mu4e-alert--find-end (&rest _)
+  "Advice to track `find' request start."
+  (setq mu4e-alert--finding-p nil))
+
+(advice-add (symbol-function #'mu4e-alert--mu4e-proc-find-func) :before #'mu4e-alert--find-start)
+(advice-add mu4e-alert--found-func-save :before #'mu4e-alert--find-end)
 
 ;;;###autoload
 (defun mu4e-alert-enable-mode-line-display ()
